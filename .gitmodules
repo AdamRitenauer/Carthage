@@ -15,7 +15,7 @@
 	url = https://github.com/Carthage/Commandant.git
 [submodule "Carthage/Checkouts/ReactiveTask"]
 	path = Carthage/Checkouts/ReactiveTask
-	url = https://github.com/Carthage/ReactiveTask.git
+	url = https://github.com/AdamRitenauer/ReactiveTask.git
 [submodule "Carthage/Checkouts/Argo"]
 	path = Carthage/Checkouts/Argo
 	url = https://github.com/thoughtbot/Argo.git

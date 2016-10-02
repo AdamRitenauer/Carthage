@@ -90,6 +90,7 @@ public func locateProjectsInDirectory(directoryURL: NSURL) -> SignalProducer<Pro
 	let enumerationOptions: NSDirectoryEnumerationOptions = [ .SkipsHiddenFiles, .SkipsPackageDescendants ]
 
 	return gitmodulesEntriesInRepository(directoryURL, revision: nil)
+		.ignoreTaskData()
 		.map { directoryURL.appendingPathComponent($0.path) }
 		.concat(value: directoryURL.appendingPathComponent(CarthageProjectCheckoutsPath))
 		.collect()
@@ -115,6 +116,7 @@ public func locateProjectsInDirectory(directoryURL: NSURL) -> SignalProducer<Pro
 		.collect()
 		.map { $0.sort() }
 		.flatMap(.Merge) { SignalProducer<ProjectLocator, CarthageError>(values: $0) }
+
 }
 
 /// Creates a task description for executing `xcodebuild` with the given

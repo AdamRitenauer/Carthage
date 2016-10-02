@@ -9,6 +9,7 @@
 import Foundation
 import Result
 import ReactiveCocoa
+import ReactiveTask
 import Tentacle
 
 /// Carthage's bundle identifier.
@@ -268,15 +269,14 @@ public final class Project {
 	///
 	/// Returns a signal which will send the URL to the repository's folder on
 	/// disk once cloning or fetching has completed.
-	private func cloneOrFetchDependency(project: ProjectIdentifier, commitish: String? = nil) -> SignalProducer<NSURL, CarthageError> {
+	private func cloneOrFetchDependency(project: ProjectIdentifier, commitish: String? = nil) -> SignalProducer<TaskEvent<NSURL>, CarthageError> {
 		return cloneOrFetchProject(project, preferHTTPS: self.preferHTTPS, commitish: commitish)
-			.on(next: { event, _ in
-				if let event = event {
+			.on(next: { taskEvent in
+				if let event = taskEvent.value?.projectEvent {
 					self._projectEventsObserver.sendNext(event)
 				}
 			})
-			.map { _, URL in URL }
-			.takeLast(1)
+			.map { $0.map { $0.URL } }
 			.startOnQueue(gitOperationQueue)
 	}
 
@@ -286,8 +286,15 @@ public final class Project {
 	/// necessary.
 	private func versionsForProject(project: ProjectIdentifier) -> SignalProducer<PinnedVersion, CarthageError> {
 		let fetchVersions = cloneOrFetchDependency(project)
-			.flatMap(.Merge) { repositoryURL in listTags(repositoryURL) }
-			.map { PinnedVersion($0) }
+			.flatMap(.Merge) {
+				$0.producerMap {repositoryURL in
+					listTags(repositoryURL)
+				}
+			}
+			.map {
+				$0.map { PinnedVersion($0) }
+			}
+			.ignoreTaskData()
 			.collect()
 			.on(next: { newVersions in
 				self.cachedVersions[project] = newVersions
@@ -319,9 +326,14 @@ public final class Project {
 	private func cartfileForDependency(dependency: Dependency<PinnedVersion>) -> SignalProducer<Cartfile, CarthageError> {
 		let revision = dependency.version.commitish
 		return self.cloneOrFetchDependency(dependency.project, commitish: revision)
-			.flatMap(.Concat) { repositoryURL in
-				return contentsOfFileInRepository(repositoryURL, CarthageProjectCartfilePath, revision: revision)
+			.flatMap(.Concat) {
+				
+				$0.producerMap { repositoryURL in
+				
+					return contentsOfFileInRepository(repositoryURL, CarthageProjectCartfilePath, revision: revision).ignoreTaskData()
+				}
 			}
+			.ignoreTaskData()
 			.flatMapError { _ in .empty }
 			.attemptMap(Cartfile.fromString)
 	}
@@ -332,12 +344,14 @@ public final class Project {
 		return cloneOrFetchDependency(project, commitish: reference)
 			.flatMap(.Concat) { _ in
 				return resolveTagInRepository(repositoryURL, reference)
+					.ignoreTaskData()
 					.map { _ in
 						// If the reference is an exact tag, resolves it to the tag.
 						return PinnedVersion(reference)
 					}
 					.flatMapError { _ in
 						return resolveReferenceInRepository(repositoryURL, reference)
+							.ignoreTaskData()
 							.map(PinnedVersion.init)
 					}
 			}
@@ -569,29 +583,35 @@ public final class Project {
 		let project = dependency.project
 		let revision = dependency.version.commitish
 		return cloneOrFetchDependency(project, commitish: revision)
-			.flatMap(.Merge) { repositoryURL -> SignalProducer<(), CarthageError> in
-				let workingDirectoryURL = self.directoryURL.appendingPathComponent(project.relativePath, isDirectory: true)
-				var submodule: Submodule?
+			.flatMap(.Merge) {
 				
-				if var foundSubmodule = submodulesByPath[project.relativePath] {
-					foundSubmodule.URL = repositoryURLForProject(project, preferHTTPS: self.preferHTTPS)
-					foundSubmodule.SHA = revision
-					submodule = foundSubmodule
-				} else if self.useSubmodules {
-					submodule = Submodule(name: project.relativePath, path: project.relativePath, URL: repositoryURLForProject(project, preferHTTPS: self.preferHTTPS), SHA: revision)
-				}
+				$0.producerMap { repositoryURL -> SignalProducer<(), CarthageError> in
 				
-				if let submodule = submodule {
-					return addSubmoduleToRepository(self.directoryURL, submodule, GitURL(repositoryURL.path!))
-						.startOnQueue(self.gitOperationQueue)
-				} else {
-					return checkoutRepositoryToDirectory(repositoryURL, workingDirectoryURL, revision: revision)
-						.then(self.dependenciesForDependency(dependency))
-						.flatMap(.Merge) { dependencies in
-							return self.symlinkCheckoutPathsForDependencyProject(dependency.project, subDependencies: dependencies, rootDirectoryURL: self.directoryURL)
-						}
+					let workingDirectoryURL = self.directoryURL.appendingPathComponent(project.relativePath, isDirectory: true)
+					var submodule: Submodule?
+					
+					if var foundSubmodule = submodulesByPath[project.relativePath] {
+						foundSubmodule.URL = repositoryURLForProject(project, preferHTTPS: self.preferHTTPS)
+						foundSubmodule.SHA = revision
+						submodule = foundSubmodule
+					} else if self.useSubmodules {
+						submodule = Submodule(name: project.relativePath, path: project.relativePath, URL: repositoryURLForProject(project, preferHTTPS: self.preferHTTPS), SHA: revision)
+					}
+					
+					if let submodule = submodule {
+						return addSubmoduleToRepository(self.directoryURL, submodule, GitURL(repositoryURL.path!))
+							.ignoreTaskData()
+							.startOnQueue(self.gitOperationQueue)
+					} else {
+						return checkoutRepositoryToDirectory(repositoryURL, workingDirectoryURL, revision: revision)
+							.then(self.dependenciesForDependency(dependency))
+							.flatMap(.Merge) { dependencies in
+								return self.symlinkCheckoutPathsForDependencyProject(dependency.project, subDependencies: dependencies, rootDirectoryURL: self.directoryURL)
+							}
+					}
 				}
 			}
+			.ignoreTaskData()
 			.on(started: {
 				self._projectEventsObserver.sendNext(.CheckingOut(project, revision))
 			})
@@ -638,6 +658,7 @@ public final class Project {
 		/// Determine whether the repository currently holds any submodules (if
 		/// it even is a repository).
 		let submodulesSignal = submodulesInRepository(self.directoryURL)
+			.ignoreTaskData()
 			.reduce([:]) { (submodulesByPath: [String: Submodule], submodule) in
 				var submodulesByPath = submodulesByPath
 				submodulesByPath[submodule.path] = submodule
@@ -960,6 +981,15 @@ internal func relativeLinkDestinationForDependencyProject(dependency: ProjectIde
 	return linkDestinationPath
 }
 
+// Replace tuple return type from cloneOrFetchProject with a struct
+// to avoid a compiler crash. Crash is fixed for Swift 3, this a 
+// work around for legacy swift.
+public struct CloneOrFetchResult {
+	
+	let projectEvent:ProjectEvent?
+	let URL:NSURL
+}
+
 /// Clones the given project to the given destination URL (defaults to the global
 /// repositories folder), or fetches inside it if it has already been cloned.
 /// Optionally takes a commitish to check for prior to fetching.
@@ -967,7 +997,7 @@ internal func relativeLinkDestinationForDependencyProject(dependency: ProjectIde
 /// Returns a signal which will send the operation type once started, and
 /// the URL to where the repository's folder will exist on disk, then complete
 /// when the operation completes.
-public func cloneOrFetchProject(project: ProjectIdentifier, preferHTTPS: Bool, destinationURL: NSURL = CarthageDependencyRepositoriesURL, commitish: String? = nil) -> SignalProducer<(ProjectEvent?, NSURL), CarthageError> {
+public func cloneOrFetchProject(project: ProjectIdentifier, preferHTTPS: Bool, destinationURL: NSURL = CarthageDependencyRepositoriesURL, commitish: String? = nil) -> SignalProducer<TaskEvent<CloneOrFetchResult>, CarthageError> {
 	let fileManager = NSFileManager.defaultManager()
 	let repositoryURL = repositoryFileURLForProject(project, baseURL: destinationURL)
 
@@ -980,43 +1010,46 @@ public func cloneOrFetchProject(project: ProjectIdentifier, preferHTTPS: Bool, d
 
 			return .Success(repositoryURLForProject(project, preferHTTPS: preferHTTPS))
 		}
-		.flatMap(.Merge) { remoteURL -> SignalProducer<(ProjectEvent?, NSURL), CarthageError> in
+		.flatMap(.Merge) { remoteURL -> SignalProducer<TaskEvent<CloneOrFetchResult>, CarthageError> in
 			return isGitRepository(repositoryURL)
-				.flatMap(.Merge) { isRepository -> SignalProducer<(ProjectEvent?, NSURL), CarthageError> in
-					if isRepository {
-						let fetchProducer: () -> SignalProducer<(ProjectEvent?, NSURL), CarthageError> = {
-							guard FetchCache.needsFetch(forURL: remoteURL) else {
-								return SignalProducer(value: (nil, repositoryURL))
+				.flatMap(.Merge) { event in
+					
+					event.map { isRepository -> SignalProducer<CloneOrFetchResult, CarthageError> in
+						
+						if isRepository {
+							let fetchProducer: () -> SignalProducer<TaskEvent<(ProjectEvent?, NSURL)>, CarthageError> = {
+								guard FetchCache.needsFetch(forURL: remoteURL) else {
+									return .init(value: CloneOrFetchResult(projectEvent:nil, URL:repositoryURL))
+								}
+
+								return fetchRepository(repositoryURL, remoteURL: remoteURL, refspec: "+refs/heads/*:refs/heads/*").flatMapTaskEvents(.Concat) { _ in SignalProducer(value: CloneOrFetchResult(projectEvent:.Fetching(project), URL:repositoryURL)) }
 							}
 
-							return SignalProducer(value: (.Fetching(project), repositoryURL))
-								.concat(fetchRepository(repositoryURL, remoteURL: remoteURL, refspec: "+refs/heads/*:refs/heads/*").then(.empty))
-						}
-
-						// If we've already cloned the repo, check for the revision, possibly skipping an unnecessary fetch
-						if let commitish = commitish {
-							return zip(
-									branchExistsInRepository(repositoryURL, pattern: commitish),
-									commitExistsInRepository(repositoryURL, revision: commitish)
-								)
-								.flatMap(.Concat) { branchExists, commitExists -> SignalProducer<(ProjectEvent?, NSURL), CarthageError> in
-									// If the given commitish is a branch, we should fetch.
-									if branchExists || !commitExists {
-										return fetchProducer()
-									} else {
-										return SignalProducer(value: (nil, repositoryURL))
+							// If we've already cloned the repo, check for the revision, possibly skipping an unnecessary fetch
+							if let commitish = commitish {
+								return branchExistsInRepository(repositoryURL, pattern: commitish).flatMap { branchExists in
+									
+									commitExistsInRepository(repositoryURL, revision: commitish).flatMap(.Concat) { commitExists -> SignalProducer<(ProjectEvent?, NSURL), CarthageError> in
+										
+										// If the given commitish is a branch, we should fetch.
+										if branchExists || !commitExists {
+											return fetchProducer()
+										} else {
+											return SignalProducer(value: .Success(CloneOrFetchResult(nil, repositoryURL)))
+										}
 									}
 								}
+							} else {
+								return fetchProducer()
+							}
 						} else {
-							return fetchProducer()
+							// Either the directory didn't exist or it did but wasn't a git repository
+							// (Could happen if the process is killed during a previous directory creation)
+							// So we remove it, then clone
+							_ = try? fileManager.removeItemAtURL(repositoryURL)
+							return SignalProducer(value: CloneOrFetchResult(projectEvent:.Cloning(project), URL:repositoryURL))
+								.concat(cloneRepository(remoteURL, repositoryURL).then(.empty))
 						}
-					} else {
-						// Either the directory didn't exist or it did but wasn't a git repository
-						// (Could happen if the process is killed during a previous directory creation)
-						// So we remove it, then clone
-						_ = try? fileManager.removeItemAtURL(repositoryURL)
-						return SignalProducer(value: (.Cloning(project), repositoryURL))
-							.concat(cloneRepository(remoteURL, repositoryURL).then(.empty))
 					}
 			}
 		}

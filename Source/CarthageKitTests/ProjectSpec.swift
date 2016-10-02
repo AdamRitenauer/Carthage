@@ -95,6 +95,7 @@ class ProjectSpec: QuickSpec {
 			func addCommit() -> String {
 				_ = launchGitTask([ "commit", "--allow-empty", "-m \"Empty commit\"" ], repositoryFileURL: repositoryURL).wait()
 				return launchGitTask([ "rev-parse", "--short", "HEAD" ], repositoryFileURL: repositoryURL)
+					.ignoreTaskData()
 					.last()!
 					.value!
 					.stringByTrimmingCharactersInSet(.newlineCharacterSet())
